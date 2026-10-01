@@ -9,7 +9,7 @@ from ..events.service import (
     commit_and_publish,
 )
 from ..locking import writer_lock
-from ..models import Match, Participant, Round, Tournament
+from ..models import CheckInSnapshot, Match, Participant, Round, Tournament
 from ..schemas import (
     MatchResponse,
     ParticipantCreate,
@@ -93,10 +93,18 @@ def _ensure_registration_open(db: Session, tournament_id: int) -> None:
         .filter(Round.tournament_id == tournament_id)
         .first()
     )
-    if has_round is not None:
+    has_first_round_checkin = (
+        db.query(CheckInSnapshot.id)
+        .filter(
+            CheckInSnapshot.tournament_id == tournament_id,
+            CheckInSnapshot.round_no == 1,
+        )
+        .first()
+    )
+    if has_round is not None or has_first_round_checkin is not None:
         raise HTTPException(
             status_code=409,
-            detail="首轮生成后不允许再增删参赛者",
+            detail="首轮签到快照建立或首轮生成后不允许再增删参赛者",
         )
 
 

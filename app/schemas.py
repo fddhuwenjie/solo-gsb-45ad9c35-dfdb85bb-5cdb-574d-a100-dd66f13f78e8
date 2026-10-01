@@ -88,6 +88,72 @@ class RoundResponse(BaseModel):
     matches: list[MatchResponse] = []
 
 
+# ---------- Check-in ----------
+
+class CheckInSnapshotRequest(BaseModel):
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    round_no: int = Field(ge=1, description="尚未生成的目标轮次号")
+    present_numbers: list[int] = Field(
+        description="到场参赛者编号；与缺席名单合并后必须恰好覆盖当前报名名单"
+    )
+    absent_numbers: list[int] = Field(
+        description="缺席参赛者编号；与到场名单互不相交"
+    )
+
+    @field_validator("present_numbers", "absent_numbers")
+    @classmethod
+    def _check_positive_numbers(cls, v: list[int]) -> list[int]:
+        if any(n < 1 for n in v):
+            raise ValueError("参赛者编号必须为正整数")
+        return v
+
+
+class CheckInConfirmRequest(BaseModel):
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    round_no: int = Field(ge=1, description="要确认的目标轮次号")
+
+
+class CheckInParticipantResponse(BaseModel):
+    participant_id: int
+    number: int
+    name: str
+    attended: bool
+
+
+class CheckInSnapshotResponse(BaseModel):
+    id: int
+    tournament_id: int
+    round_no: int
+    # 首次提交为 1，每次成功变更签到名单 +1
+    version: int
+    present_numbers: list[int]
+    absent_numbers: list[int]
+    roster: list[CheckInParticipantResponse]
+    # 是否已由运营方确认；名单变更后重置为 False
+    confirmed: bool
+    # 目标轮次生成后冻结为 True
+    consumed: bool
+    confirmed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("confirmed_at", "created_at", "updated_at")
+    def serialize_times(self, v: datetime | None) -> str | None:
+        return _serialize_utc(v)
+
+
 class ResultUpdate(BaseModel):
     # 0 / 1 / 2 个半分，即允许 0、0.5、1
     score_white: float = Field(ge=0, le=1, description="小白方得分：0 / 0.5 / 1")

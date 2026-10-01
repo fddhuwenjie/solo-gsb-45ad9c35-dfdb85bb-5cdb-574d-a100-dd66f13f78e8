@@ -48,6 +48,95 @@ class Tournament(Base):
         cascade="all, delete-orphan",
         order_by="Event.seq",
     )
+    checkin_snapshots: Mapped[list["CheckInSnapshot"]] = relationship(
+        back_populates="tournament",
+        cascade="all, delete-orphan",
+        order_by="CheckInSnapshot.round_no",
+    )
+
+
+class CheckInSnapshot(Base):
+    """目标轮次尚未生成时的现场签到快照。
+
+    每个赛事、轮次只保留当前最新的一版；新的签到提交会版本递增并
+    覆盖名单。轮次生成后快照冻结，不能再修改或确认。缺席参赛者保留
+    既有积分和历史对局，但不参与目标轮次的配对/轮空，也不获得本轮
+    积分。
+    """
+
+    __tablename__ = "checkin_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "round_no", name="uq_checkin_snapshot_round"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    round_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 当前版本：首次提交为 1，每次成功变更 +1
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 到场参赛者编号快照（按编号升序）
+    present_numbers: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    # 缺席参赛者编号快照（按编号升序）
+    absent_numbers: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    # 运营方是否已确认该快照；后续名单变更会重置为 False
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 轮次生成后为 True，用于冻结快照
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    tournament: Mapped[Tournament] = relationship(back_populates="checkin_snapshots")
+    actions: Mapped[list["CheckInAction"]] = relationship(
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+        order_by="CheckInAction.id",
+    )
+
+
+class CheckInAction(Base):
+    """签到变更/确认请求的幂等记录：同一 request_id 重放原样返回。
+
+    记录与快照变更、checkin.* 事件在同一事务中提交；被拒绝的请求
+    （快照/序号冲突、名单重复或不完整、轮次已生成，409）不留记录。
+    """
+
+    __tablename__ = "checkin_actions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tournament_id", "request_id", name="uq_checkin_action_request"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tournament_id: Mapped[int] = mapped_column(
+        ForeignKey("tournaments.id", ondelete="CASCADE"), nullable=False
+    )
+    snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("checkin_snapshots.id", ondelete="CASCADE"), nullable=True
+    )
+    # 客户端幂等键：赛事内唯一
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # submit（提交/变更签到名单）/ confirm（确认快照）
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 请求参数指纹：submit 含 round_no/expected_event_seq/两组名单；
+    # confirm 含 round_no
+    params: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 首次执行后的响应快照：重复 request_id 原样返回
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    snapshot: Mapped[CheckInSnapshot | None] = relationship(back_populates="actions")
 
 
 class Participant(Base):

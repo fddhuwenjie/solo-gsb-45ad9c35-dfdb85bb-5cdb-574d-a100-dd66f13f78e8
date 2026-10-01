@@ -7,6 +7,7 @@ from .database import init_db
 from .events.bus import event_bus
 from .routers import (
     announcements,
+    checkins,
     clock,
     events,
     penalties,
@@ -31,7 +32,9 @@ app = FastAPI(
     description=(
         "编程挑战赛瑞士轮编排服务：创建赛事、录入参赛者与每轮赛果，"
         "按积分分组生成下一轮（禁止重复交手、全局最小化跨组积分差、"
-        "奇数人轮空给未轮空且排名最低者），并提供含 Buchholz 分的排名。"
+        "奇数人轮空给未轮空且排名最低者），并支持为尚未生成的下一轮"
+        "维护版本化现场签到快照：到场者参与配对/轮空，缺席者保留历史"
+        "但本轮不得分；未提交快照时按全员编排。"
         "支持维护赛事工位（编号/可用状态/能力标签）与参赛者必需标签，"
         "为每一轮发布版本化工位分配方案（最多分配 → 最少换位 → "
         "固定裁决，容量不足时保存最大可行方案并说明原因）。"
@@ -53,7 +56,7 @@ app = FastAPI(
         "积分为准，账本可按参赛者完整查询。"
         "另提供每赛事独立序号、可断线续传的 SSE 赛事事件流。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -65,6 +68,7 @@ def health() -> dict[str, str]:
 
 app.include_router(tournaments.router)
 app.include_router(rounds.router)
+app.include_router(checkins.router)
 app.include_router(stations.router)
 app.include_router(clock.router)
 app.include_router(announcements.router)

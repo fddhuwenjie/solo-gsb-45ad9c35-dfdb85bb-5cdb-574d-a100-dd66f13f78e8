@@ -15,6 +15,13 @@
   依次**最大化已分配对局数**、**最小化选手相对上一轮的换位次数**，
   再按 `(match_id, station_no)` 字典序固定裁决；容量不足时仍保存
   最大可行方案，并逐场说明未分配对局缺少的标签或冲突的已占工位；
+- **现场报到签到快照**：下一轮尚未生成时，运营方可按目标轮次提交
+  到场/缺席参赛者编号快照（携带 `request_id` 幂等键与
+  `expected_event_seq` 序号快照）；两组名单必须互不相交且恰好覆盖
+  当前报名名单。同一份快照可更新，版本递增并写入签到变更事件；
+  确认后可再次更新但旧确认自动失效，需重新确认。生成轮次时若存在
+  快照，仅到场者进入瑞士配对与轮空选择，缺席者保留历史积分/对局但
+  本轮不得分；未提交快照则沿用全员编排。
 - **持久化轮次计时**：轮次生成后可启动计时（`start` 设定总时长），
   支持全局 `pause` / `resume` 与对指定非轮空对局的 `extend` 加时；
   剩余时间由服务端 UTC 锚点与累计暂停时长在读取时推算，**不运行
@@ -117,7 +124,7 @@ curl -X POST http://localhost:8000/tournaments/1/participants/bulk \
 
 也可单个录入：`POST /tournaments/{id}/participants`，body `{"name": "Alice"}`。
 
-> 首轮生成后赛事名单即锁定，不能再增删参赛者。
+> 首轮签到快照建立或首轮生成后，赛事名单即锁定，不能再增删参赛者。
 
 ### 3. 生成下一轮
 
@@ -146,7 +153,75 @@ curl -X POST http://localhost:8000/tournaments/1/rounds/next
 - 奇数人的轮空场次 `is_bye=true`，轮空方自动得 1 分，无需录入；
 - 上一轮未全部录完时调用会返回 `409`。
 
-### 4. 录入赛果
+### 4. 为下一轮建立/确认现场签到快照
+
+在第 1 轮结束、第 2 轮尚未生成时，可以先为第 2 轮建立可更新的签到
+快照。`present_numbers` 与 `absent_numbers` 使用参赛者编号，两个
+集合必须互不相交，并且合并后恰好等于当前报名名单：
+
+```bash
+curl -X PUT http://localhost:8000/tournaments/1/checkin-snapshots \
+  -H "Content-Type: application/json" \
+  -d '{
+        "request_id": "round2-checkin-v1",
+        "expected_event_seq": 9,
+        "round_no": 2,
+        "present_numbers": [1, 3, 4, 5],
+        "absent_numbers": [2]
+      }'
+```
+
+```json
+{
+  "id": 1,
+  "tournament_id": 1,
+  "round_no": 2,
+  "version": 1,
+  "present_numbers": [1, 3, 4, 5],
+  "absent_numbers": [2],
+  "roster": [
+    {"participant_id": 1, "number": 1, "name": "Alice", "attended": true},
+    {"participant_id": 2, "number": 2, "name": "Bob", "attended": false},
+    {"participant_id": 3, "number": 3, "name": "Cara", "attended": true},
+    {"participant_id": 4, "number": 4, "name": "Dan", "attended": true},
+    {"participant_id": 5, "number": 5, "name": "Eve", "attended": true}
+  ],
+  "confirmed": false,
+  "consumed": false,
+  "confirmed_at": null,
+  "created_at": "2026-10-01T09:00:00Z",
+  "updated_at": "2026-10-01T09:00:00Z"
+}
+```
+
+现场名单变化时，用新的 `request_id` 再次提交即可；同一轮快照保留
+同一 `id`，`version` 递增。相同 `request_id` 与请求体重放会原样
+返回首次结果，不产生新版本或事件。序号过期、名单重复、名单未恰好
+覆盖报名名单、目标轮次不是尚未生成的下一轮，均返回 `409` 且不留
+记录。
+
+```bash
+# 确认第 2 轮签到快照
+curl -X POST http://localhost:8000/tournaments/1/checkin-snapshots/confirm \
+  -H "Content-Type: application/json" \
+  -d '{
+        "request_id": "round2-checkin-confirm-v1",
+        "expected_event_seq": 10,
+        "round_no": 2
+      }'
+
+# 查询某轮快照，或列出全部快照
+curl http://localhost:8000/tournaments/1/checkin-snapshots/2
+curl http://localhost:8000/tournaments/1/checkin-snapshots
+```
+
+随后照常调用 `POST /tournaments/1/rounds/next`：若第 2 轮快照存在，
+只有 `present_numbers` 中的参赛者进入瑞士配对和轮空选择；缺席者
+保留此前积分与历史对局，但不会获得第 2 轮积分，也不会改变已经结束
+轮次的任何数据。没有快照时，生成逻辑仍按全员编排。轮次生成后
+`consumed=true`，该快照冻结，不能再更新或确认。
+
+### 5. 录入赛果
 
 每场得分只能取 `0`、`0.5`、`1`，双方之和必须为 `1`：
 
@@ -161,7 +236,7 @@ curl -X PUT http://localhost:8000/matches/2/result \
   -d '{"score_white": 0.5, "score_black": 0.5}'
 ```
 
-### 5. 查询排名（含有效扣分、排名积分与 Buchholz 分）
+### 6. 查询排名（含有效扣分、排名积分与 Buchholz 分）
 
 ```bash
 curl http://localhost:8000/tournaments/1/standings
@@ -194,7 +269,7 @@ curl http://localhost:8000/tournaments/1/standings
 Alice 居首；Bob 虽 0 分，但因输给 Alice，Buchholz 为 1.0。无扣分
 时 `rank_points` 与 `points` 一致、`penalty` 为 0。
 
-### 6. 订阅赛事事件流（SSE，供现场大屏 / 解说端）
+### 7. 订阅赛事事件流（SSE，供现场大屏 / 解说端）
 
 `GET /tournaments/{id}/events/stream` 以 `text/event-stream` 持续推送
 该赛事的事件。服务默认监听 **8000 端口**，订阅命令：
@@ -238,7 +313,8 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `round_clock.paused`、`round_clock.resumed`、
   `round_clock.extended`、`announcement.published`、
   `announcement.acknowledged`、`result_review.created`、
-  `result_review.closed`、`penalty.recorded`、`penalty.revoked`；
+  `result_review.closed`、`penalty.recorded`、`penalty.revoked`、
+  `checkin.snapshot_changed`、`checkin.snapshot_confirmed`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -256,7 +332,7 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
 > 唯一性由数据库原子计数器与唯一约束保证；多进程部署需改用跨进程
 > 的事件总线（如 Redis/PostgreSQL LISTEN）。
 
-### 7. 分页查询历史事件
+### 8. 分页查询历史事件
 
 ```bash
 # 按序号升序，每页 2 条
@@ -280,7 +356,7 @@ curl "http://localhost:8000/tournaments/1/events?after=0&limit=2"
 用上一页返回的 `last_seq` 作为下一次的 `after` 即可翻页；
 `has_more=false` 表示已读完全部。
 
-### 8. 维护工位与参赛者必需标签
+### 9. 维护工位与参赛者必需标签
 
 工位有**编号**（赛事内唯一）、**可用状态**与**能力标签**；参赛者可
 登记**必需标签**。分配工位时，工位必须可用且其能力标签覆盖对局
@@ -313,7 +389,7 @@ curl http://localhost:8000/tournaments/1/stations
 `409`。首轮生成后仍可调整工位与标签（已发布的方案是快照，不受
 后续变更影响）。
 
-### 9. 发布与查询轮次工位方案
+### 10. 发布与查询轮次工位方案
 
 轮次生成后，为该轮发布工位分配方案。请求携带：
 
@@ -378,7 +454,7 @@ curl http://localhost:8000/tournaments/1/rounds/1/station-plans
 curl http://localhost:8000/tournaments/1/rounds/1/station-plans/1
 ```
 
-### 10. 轮次计时（持久化时钟）
+### 11. 轮次计时（持久化时钟）
 
 轮次生成后可为该轮启动计时。所有计时命令走同一个端点，请求体携带：
 
@@ -461,7 +537,7 @@ curl http://localhost:8000/tournaments/1/rounds/1/clock
    SSE 订阅者与事件分页接口立即可见；被拒绝的命令不产生事件、
    不落任何数据。
 
-### 11. 定向赛务公告与确认回执
+### 12. 定向赛务公告与确认回执
 
 赛事进行中可发布**定向公告**（如检录、调台通知）。发布请求携带：
 
@@ -595,7 +671,7 @@ curl http://localhost:8000/announcements/1/revisions
 curl http://localhost:8000/announcements/1/revisions/1
 ```
 
-### 12. 已提交赛果的可审计复核
+### 13. 已提交赛果的可审计复核
 
 赛果已提交、但尚未生成下一轮时，如发现登记有误，可发起一条**双方
 复核**。创建请求携带：
@@ -734,7 +810,7 @@ curl http://localhost:8000/tournaments/1/result-reviews
   `result_review.closed` 事件在同一事务提交，要么全部生效要么全部
   回滚；待处理复核存在期间生成下一轮、修改该场赛果一律 `409`。
 
-### 13. 可追溯的扣分账本
+### 14. 可追溯的扣分账本
 
 赛务争议处理中，裁判可为参赛者登记**扣分**（如迟到、违规），也可以
 一条**新记录撤销**仍生效的扣分。账本只增不改：撤销不删除原扣分，
@@ -893,7 +969,11 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 | POST | `/tournaments/{id}/stations/bulk` | 批量新增工位 |
 | GET | `/tournaments/{id}/stations` | 工位列表（按编号） |
 | PUT | `/tournaments/{id}/stations/{station_no}` | 更新工位可用状态与能力标签 |
-| POST | `/tournaments/{id}/rounds/next` | 生成下一轮 |
+| POST | `/tournaments/{id}/rounds/next` | 生成下一轮（存在签到快照时仅安排到场者） |
+| PUT/POST | `/tournaments/{id}/checkin-snapshots` | 提交/更新下一轮签到快照（幂等 + 序号快照） |
+| POST | `/tournaments/{id}/checkin-snapshots/confirm` | 确认下一轮签到快照（幂等 + 序号快照） |
+| GET | `/tournaments/{id}/checkin-snapshots` | 赛事全部签到快照 |
+| GET | `/tournaments/{id}/checkin-snapshots/{round_no}` | 查询指定轮次签到快照的版本与名单 |
 | GET | `/tournaments/{id}/rounds` | 所有轮次与对阵 |
 | GET | `/tournaments/{id}/rounds/{round_no}` | 指定轮次 |
 | POST | `/tournaments/{id}/rounds/{round_no}/station-plans` | 发布该轮工位方案（新版本） |
@@ -935,6 +1015,10 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
    「编号最小的选手优先搭配编号尽可能小的可行搭档，依次类推」。
 4. 奇数人轮空：按当前排名（积分 → Buchholz → 编号）取排名最低
    且尚未轮空者；全部都轮空过时再取排名最低者。
+5. 目标轮存在签到快照时，只对到场者执行上述排名、轮空与配对；
+   缺席者不进入算法、本轮不得分，历史轮次和历史对阵保持不变。
+   到场人数为奇数时轮空从到场者中选择；无人到场时该轮立即封盘且
+   不生成任何对局。未提交签到快照时仍按全员编排。
 
 ## 工位分配规则细则
 

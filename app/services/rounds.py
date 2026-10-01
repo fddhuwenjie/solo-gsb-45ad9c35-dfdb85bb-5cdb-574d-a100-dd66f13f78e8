@@ -13,6 +13,7 @@ from ..events.service import (
     append_event,
 )
 from ..models import Event, Match, Participant, Round
+from .checkins import active_snapshot_for_next_round
 from .result_reviews import has_pending_review_for_tournament
 from .scoring import compute_records
 from .swiss import WIN, swiss_pair
@@ -60,9 +61,23 @@ def generate_next_round(
     )
     next_no = (rounds[-1].round_no + 1) if rounds else 1
 
+    # 现场签到快照存在时，仅到场者参与本轮瑞士配对与轮空；缺席者
+    # 保留此前积分/历史，但本轮不会得到任何积分或新增对阵。未提交
+    # 快照时沿用当前全员名单。
+    checkin = active_snapshot_for_next_round(db, tournament_id, next_no)
+    participants = tournament_participants
+    if checkin is not None:
+        present_numbers = set(checkin.present_numbers)
+        participants = [
+            p for p in tournament_participants if p.number in present_numbers
+        ]
+
     # 当前排名（仅统计已结束轮次）：排名积分降序 -> Buchholz 降序 ->
     # 编号升序；下一轮积分分组以排名积分（对局积分 - 有效扣分）为准
     records = compute_records(db, tournament_id)
+    if checkin is not None:
+        present_ids = {p.id for p in participants}
+        records = [r for r in records if r.participant_id in present_ids]
     ranking_ids = [r.participant_id for r in records]
     points_by_id = {r.participant_id: r.rank_points for r in records}
 
@@ -81,7 +96,7 @@ def generate_next_round(
         byed_ids = {m.player_white_id for m in bye_matches}
 
     bye_id: int | None = None
-    if len(tournament_participants) % 2 == 1:
+    if len(participants) % 2 == 1:
         # 轮空给「尚未轮空且排名最低」的选手；
         # 若所有人都轮空过，则取排名最低者
         eligible = [pid for pid in ranking_ids if pid not in byed_ids]
@@ -125,6 +140,11 @@ def generate_next_round(
     )
     db.add(round_obj)
     db.flush()  # 取得 round_obj.id
+
+    if checkin is not None:
+        # 轮次一旦生成即冻结所采用的签到快照；后续拒绝修改/确认
+        checkin.consumed = True
+        db.flush()
 
     # 普通对局（swiss_pair 已按小白号升序返回），暂不记分
     for white_id, black_id in result.pairs:
@@ -170,6 +190,11 @@ def generate_next_round(
     }
     if bye_match_id is not None:
         generated_payload["bye_match_id"] = bye_match_id
+    if checkin is not None:
+        generated_payload["checkin_snapshot_id"] = checkin.id
+        generated_payload["checkin_version"] = checkin.version
+        generated_payload["present_numbers"] = list(checkin.present_numbers)
+        generated_payload["absent_numbers"] = list(checkin.absent_numbers)
     events = [
         append_event(db, tournament_id, ROUND_GENERATED, generated_payload)
     ]
