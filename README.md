@@ -50,6 +50,17 @@
   积分 − 有效扣分，**允许为负**）；排序、Buchholz（随对手的排名
   积分重算）与下一轮积分分组均以排名积分为准。账本只增不改，可按
   参赛者查询完整记录。
+- **现场签到快照**：轮次生成前可为**尚未生成的下一轮**提交一份
+  **可更新**的到场/缺席快照（携带 `request_id` 幂等键、
+  `expected_event_seq` 序号快照、目标轮次与完整的到场/缺席参赛者
+  编号集合）；两个集合必须**恰好覆盖当前报名名单**，序号冲突、
+  编号重复或目标轮次已生成一律 `409` 且**不留任何记录**。首次
+  提交版本为 1，名单实际变更版本 +1，确认后置为 confirmed。
+  生成下一轮时**只让快照中的到场者**进入瑞士配对与轮空选择，
+  缺席者保留原有积分与历史对局但**本轮不得分**，也不因缺席改变
+  已结束轮次；未提交快照时沿用现有全员编排。签到变更与确认事件
+  （`attendance.recorded` / `attendance.confirmed`）与快照在**同一
+  事务**写入，查询返回版本与完整名单。
 
 配对在 Edmonds 带花树（Blossom）最小权完美匹配算法上实现
 （`networkx.min_weight_matching`，O(n³)），同代价方案用可加的
@@ -238,7 +249,8 @@ data: {"tournament_id": 1, "seq": 6, "type": "round.generated",
   `round_clock.paused`、`round_clock.resumed`、
   `round_clock.extended`、`announcement.published`、
   `announcement.acknowledged`、`result_review.created`、
-  `result_review.closed`、`penalty.recorded`、`penalty.revoked`；
+  `result_review.closed`、`penalty.recorded`、`penalty.revoked`、
+  `attendance.recorded`、`attendance.confirmed`；
 - 事件与业务变更在**同一数据库事务**中写入：事务回滚则事件一并
   回滚，不会出现"有事件无变更"或"有变更无事件"；
 - **并发安全**：事件序号不再"查询最大 seq 后插入"，而是对
@@ -878,6 +890,125 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 排序、Buchholz 与下一轮积分分组的唯一依据——被扣分者在下一轮会
 按扣分后的排名积分落入对应分组。
 
+### 14. 现场签到快照（到场/缺席，可更新）
+
+每轮现场报到时，运营方可以在**轮次生成之前**为**尚未生成的下一
+轮**登记一份完整的签到快照，之后可以反复更新，直到生成下一轮。
+
+**提交/更新**：`PUT /tournaments/{id}/rounds/{round_no}/checkin`，
+请求携带：
+
+- `request_id`：幂等键（赛事内唯一），重复提交（相同参数）原样
+  返回首次结果；同一 `request_id` 携带不同参数返回 `409`；
+- `expected_event_seq`：提交前断言的赛事当前最大事件序号，用于
+  **乐观快照**——不一致返回 `409` 且不落库（先经
+  `GET /tournaments/{id}/events` 读取最新序号）；
+- `round_no`：目标轮次号，必须与路径一致且为**尚未生成的下一
+  轮**；
+- `present_numbers` / `absent_numbers`：到场 / 缺席的**参赛者
+  编号**（不是参赛者 id；编号见 `/participants`）。两个集合的
+  并集必须**恰好覆盖当前报名名单**：任一集合内编号重复、跨集合
+  重复、出现名单外编号或遗漏报名者，均返回 `409` 且不落库；
+  全员缺席（到场列表为空）允许提交。
+
+```bash
+# 先读取当前事件序号（5 人赛事，此时应为 6）
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+# 为尚未生成的第 1 轮提交签到：1-4 号到场，5 号缺席
+curl -X PUT http://localhost:8000/tournaments/1/rounds/1/checkin \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"checkin-1\", \"expected_event_seq\": $SEQ,
+       \"round_no\": 1,
+       \"present_numbers\": [1, 2, 3, 4],
+       \"absent_numbers\": [5]}"
+```
+
+```json
+{
+  "id": 1, "tournament_id": 1, "round_no": 1,
+  "version": 1, "status": "draft",
+  "expected_event_seq": 6,
+  "roster": [
+    {"participant_id": 1, "number": 1, "name": "Alice", "present": true},
+    {"participant_id": 2, "number": 2, "name": "Bob", "present": true},
+    {"participant_id": 3, "number": 3, "name": "Cara", "present": true},
+    {"participant_id": 4, "number": 4, "name": "Dan", "present": true},
+    {"participant_id": 5, "number": 5, "name": "Eve", "present": false}
+  ],
+  "present_numbers": [1, 2, 3, 4],
+  "absent_numbers": [5],
+  "created_at": "2026-10-01T08:00:00.000000Z",
+  "updated_at": "2026-10-01T08:00:00.000000Z",
+  "confirmed_at": null
+}
+```
+
+**更新语义**：
+
+- 首次提交 `version=1`、`status=draft`（HTTP `201`）；
+- 之后提交**不同**名单：版本 `+1`，状态回到 `draft`（HTTP `200`）；
+- 提交**相同**名单（即便用新的 `request_id`）：原样返回当前快照，
+  版本不变、不产生事件；
+- 任何序号冲突、编号重复/覆盖不全、目标轮次已生成（或存在尚未
+  封盘的轮次）的请求一律 `409`，**不留快照、不留幂等记录、不占
+  事件序号**。
+
+**确认**：`POST /tournaments/{id}/rounds/{round_no}/checkin/confirm`
+（携带 `request_id` 与 `expected_event_seq`）把快照置为
+`confirmed` 并记录确认时间；确认后再次提交变更会使版本 `+1` 并
+回到 `draft`。重复确认（相同或新的 `request_id`）原样返回、不
+重复产生事件。
+
+```bash
+SEQ=$(curl -s http://localhost:8000/tournaments/1/events | python3 -c \
+  "import sys,json;print(json.load(sys.stdin)['last_seq'])")
+
+curl -X POST http://localhost:8000/tournaments/1/rounds/1/checkin/confirm \
+  -H "Content-Type: application/json" \
+  -d "{\"request_id\": \"checkin-1-confirm\",
+       \"expected_event_seq\": $SEQ}"
+```
+
+**查询**（返回版本、状态与完整名单）：
+
+```bash
+# 指定轮次的签到快照（没有快照时 404）
+curl http://localhost:8000/tournaments/1/rounds/1/checkin
+
+# 赛事下的全部签到快照（按轮次号）
+curl http://localhost:8000/tournaments/1/checkins
+```
+
+**生成下一轮时消费快照**：
+
+- `POST /tournaments/{id}/rounds/next` 时若存在该轮快照，**只有
+  到场者**进入瑞士积分分组配对与轮空选择；缺席者不出现在本轮任何
+  场次中，**保留**此前积分与历史对局，但**本轮不得分**（不会因
+  缺席改动任何已结束轮次）；
+- 到场人数为奇数时，轮空只在**到场者**中按原规则（未轮空且排名
+  最低）授予；到场人数为偶数则无轮空；
+- 全员缺席或仅 1 人到场时，本轮没有普通对局，生成后立即封盘
+  （单人到场按轮空记 1 分，全员缺席无场次）；
+- 快照随轮次生成置为 `consumed`，此后再提交/确认一律 `409`；
+  `round.generated` 事件载荷新增 `attendance_snapshot`
+  （快照 id、版本与到场/缺席编号）；
+- **未提交快照时完全沿用现有全员编排**，事件载荷也不含
+  `attendance_snapshot`；
+- 首轮生成前名单尚未锁定：若提交快照后又新增参赛者，生成轮次时
+  返回 `409`，需按当前名单重新提交快照。
+
+```bash
+# 按上述快照生成第 1 轮：只有 1-4 号两场对局，5 号不参与
+curl -X POST http://localhost:8000/tournaments/1/rounds/next
+```
+
+签到变更与确认分别写入 `attendance.recorded` /
+`attendance.confirmed` 事件（载荷含快照 id、轮次、版本、到场/
+缺席编号与序号快照），与快照在**同一事务**提交；被拒绝的请求不
+产生事件、不落任何数据。SSE 订阅者与事件分页接口立即可见。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -893,9 +1024,13 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
 | POST | `/tournaments/{id}/stations/bulk` | 批量新增工位 |
 | GET | `/tournaments/{id}/stations` | 工位列表（按编号） |
 | PUT | `/tournaments/{id}/stations/{station_no}` | 更新工位可用状态与能力标签 |
-| POST | `/tournaments/{id}/rounds/next` | 生成下一轮 |
+| POST | `/tournaments/{id}/rounds/next` | 生成下一轮（有签到快照时仅到场者参与配对/轮空） |
 | GET | `/tournaments/{id}/rounds` | 所有轮次与对阵 |
 | GET | `/tournaments/{id}/rounds/{round_no}` | 指定轮次 |
+| PUT | `/tournaments/{id}/rounds/{round_no}/checkin` | 提交/更新下一轮签到快照（到场+缺席完整编号集合，幂等 + 序号快照） |
+| POST | `/tournaments/{id}/rounds/{round_no}/checkin/confirm` | 确认签到快照（幂等 + 序号快照） |
+| GET | `/tournaments/{id}/rounds/{round_no}/checkin` | 查询签到快照（版本、状态与完整名单） |
+| GET | `/tournaments/{id}/checkins` | 赛事下全部签到快照 |
 | POST | `/tournaments/{id}/rounds/{round_no}/station-plans` | 发布该轮工位方案（新版本） |
 | GET | `/tournaments/{id}/rounds/{round_no}/station-plans` | 该轮全部工位方案版本 |
 | GET | `/tournaments/{id}/rounds/{round_no}/station-plans/{version}` | 指定版本的工位方案 |
@@ -935,6 +1070,10 @@ curl http://localhost:8000/tournaments/1/participants/3/penalties
    「编号最小的选手优先搭配编号尽可能小的可行搭档，依次类推」。
 4. 奇数人轮空：按当前排名（积分 → Buchholz → 编号）取排名最低
    且尚未轮空者；全部都轮空过时再取排名最低者。
+5. **现场签到快照**：若下一轮存在签到快照，上述 1–4 只在快照的
+   **到场者**范围内进行（轮空候选也只含到场者）；缺席者不进入
+   本轮任何场次，保留此前积分与历史对局但本轮不得分。未提交
+   快照时按全员编排。
 
 ## 工位分配规则细则
 
@@ -993,7 +1132,17 @@ request_id 幂等重放与冲突、待处理期间冻结赛果且禁止生成下
 request_id 幂等重放与冲突、撤销同事务置原扣分为已撤销、重复撤销
 与撤销非扣分条目 409、排名积分可为负且排序/Buchholz/下一轮分组
 均以排名积分为准、按参赛者与赛事的完整账本查询、并发撤销同一
-扣分仅一成一败、并发同键不同参数登记仅一成落库），以及
+扣分仅一成一败、并发同键不同参数登记仅一成落库），现场签到快照
+专项（完整到场/缺席集合恰好覆盖报名名单的各类拒绝：系列内重复/
+跨集合重复/名单外编号/遗漏均 409 不落库不占号，序号冲突 409
+不落库不占号、目标轮次已生成/不是下一轮/有 open 轮次时拒绝、
+首次版本 1/draft、实际变更版本 +1 且确认后变更回 draft、无变化
+重交不推进版本不产生事件、确认与重复确认语义、request_id 幂等
+重放与同键不同参数 409、查询返回版本与完整名单、跨赛事隔离、
+生成轮次仅到场者配对/轮空且缺席者积分与历史对局不变、全员缺席
+与单人到场即时封盘、consumed 后拒绝变更、无快照全员编排、快照
+后新增报名生成时 409、attendance.* 事件同事务有序写入、并发
+更新仅一成落库），以及
 事件流专项测试——事务回滚不留事件、
 提交失败不广播且不留事件、原子计数器回滚不占号、并发报名/赛果/
 开轮（多线程屏障同时放行）下编号与序号唯一连续、并发提交按序号

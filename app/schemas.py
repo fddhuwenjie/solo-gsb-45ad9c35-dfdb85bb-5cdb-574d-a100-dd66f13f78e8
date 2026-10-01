@@ -626,3 +626,81 @@ class ParticipantPenaltyLedgerResponse(BaseModel):
     effective_penalty: float
     # 全部账本条目（含已撤销的扣分与撤销记录，按登记顺序）
     entries: list[PenaltyEntryResponse]
+
+
+# ---------- Check-in snapshot ----------
+
+class CheckinSnapshotRequest(BaseModel):
+    """面向尚未生成的下一轮的签到快照提交（可重复提交以更新）。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+    round_no: int = Field(
+        ge=1, description="目标轮次号：必须是尚未生成的下一轮"
+    )
+    # 到场参赛者编号（赛事内 number，从 1 起）
+    present_numbers: list[int] = Field(
+        default_factory=list, description="到场参赛者编号集合"
+    )
+    # 缺席参赛者编号（赛事内 number，从 1 起）
+    absent_numbers: list[int] = Field(
+        default_factory=list, description="缺席参赛者编号集合"
+    )
+
+    @field_validator("present_numbers", "absent_numbers")
+    @classmethod
+    def _check_positive(cls, v: list[int]) -> list[int]:
+        if any(n < 1 for n in v):
+            raise ValueError("参赛者编号必须为正整数")
+        return v
+
+
+class CheckinConfirmRequest(BaseModel):
+    """确认一份签到快照（可更新）。"""
+
+    request_id: str = Field(
+        min_length=1, max_length=128, description="幂等键：重复提交返回首次结果"
+    )
+    expected_event_seq: int = Field(
+        ge=0,
+        description="期望的赛事当前最大事件序号；不一致返回 409 且不落库",
+    )
+
+
+class CheckinParticipantResponse(BaseModel):
+    """签到名单中的一位参赛者。"""
+
+    participant_id: int
+    number: int
+    name: str
+    # True 到场 / False 缺席
+    present: bool
+
+
+class CheckinSnapshotResponse(BaseModel):
+    id: int
+    tournament_id: int
+    round_no: int
+    # 快照版本：首次提交为 1，每次实际变更 +1
+    version: int
+    # draft / confirmed / consumed
+    status: str
+    # 最近一次变更所断言的赛事事件序号
+    expected_event_seq: int
+    # 完整签到名单（按参赛者编号升序）
+    roster: list[CheckinParticipantResponse]
+    # 便捷视图：到场/缺席编号（按编号升序）
+    present_numbers: list[int]
+    absent_numbers: list[int]
+    created_at: datetime
+    updated_at: datetime
+    confirmed_at: datetime | None = None
+
+    @field_serializer("created_at", "updated_at", "confirmed_at")
+    def serialize_times(self, v: datetime | None) -> str | None:
+        return _serialize_utc(v)

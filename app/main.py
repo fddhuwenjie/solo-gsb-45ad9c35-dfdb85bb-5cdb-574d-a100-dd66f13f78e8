@@ -7,6 +7,7 @@ from .database import init_db
 from .events.bus import event_bus
 from .routers import (
     announcements,
+    checkins,
     clock,
     events,
     penalties,
@@ -51,9 +52,14 @@ app = FastAPI(
         "可以新记录撤销一笔仍生效的扣分；排名保留对局积分并返回有效扣分"
         "与排名积分（可为负），排序、Buchholz 与下一轮积分分组均以排名"
         "积分为准，账本可按参赛者完整查询。"
+        "支持现场签到快照：为尚未生成的下一轮提交可更新的到场/缺席"
+        "完整名单（幂等键与序号快照、集合必须恰好覆盖当前报名名单），"
+        "变更与确认同事务写入事件；生成下一轮时仅到场者进入瑞士配对"
+        "与轮空选择，缺席者保留积分与历史对局但本轮不得分，未提交"
+        "快照时沿用全员编排。"
         "另提供每赛事独立序号、可断线续传的 SSE 赛事事件流。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -70,4 +76,5 @@ app.include_router(clock.router)
 app.include_router(announcements.router)
 app.include_router(result_reviews.router)
 app.include_router(penalties.router)
+app.include_router(checkins.router)
 app.include_router(events.router)

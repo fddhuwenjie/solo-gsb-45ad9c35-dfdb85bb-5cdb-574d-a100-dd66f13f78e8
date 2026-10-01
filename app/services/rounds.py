@@ -1,5 +1,11 @@
 """轮次编排：生成下一轮（轮空决策 + 瑞士配对）。
 
+若该轮存在现场签到快照（services/checkins.py），则只让快照中的
+到场者进入瑞士配对与轮空选择；缺席者保留原有积分与历史对局但本轮
+不得分（不为其创建任何场次，也不因此改动已结束轮次）。未提交
+快照时沿用全员编排。生成时把快照置为 consumed（与轮次、事件同一
+事务）。
+
 注意：generate_next_round 只在调用方事务内写入并 flush，不提交；
 轮次/对局与 round.generated（必要时 round.closed）事件由路由层
 在同一事务中统一提交。
@@ -13,6 +19,7 @@ from ..events.service import (
     append_event,
 )
 from ..models import Event, Match, Participant, Round
+from .checkins import CONSUMED, get_snapshot
 from .result_reviews import has_pending_review_for_tournament
 from .scoring import compute_records
 from .swiss import WIN, swiss_pair
@@ -60,11 +67,39 @@ def generate_next_round(
     )
     next_no = (rounds[-1].round_no + 1) if rounds else 1
 
+    # 下一轮的现场签到快照（可能不存在 -> 全员编排）
+    snapshot = get_snapshot(db, tournament_id, next_no)
+    present_ids: set[int] | None = None
+    if snapshot is not None:
+        if snapshot.status == CONSUMED:
+            # 理论上不会发生：consumed 与轮次唯一轮次号互相对应
+            raise HTTPException(
+                status_code=409,
+                detail=f"第 {next_no} 轮的签到快照已被使用，不能重复生成",
+            )
+        snapshot_pids = {e.participant_id for e in snapshot.entries}
+        roster_pids = {p.id for p in tournament_participants}
+        if snapshot_pids != roster_pids:
+            # 首轮名单锁定前可能继续报名：快照提交后报名名单发生变化
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "签到快照的名单与当前报名名单不一致（首轮生成前名单"
+                    "可能有新增），请按当前名单重新提交签到快照"
+                ),
+            )
+        present_ids = {e.participant_id for e in snapshot.entries if e.present}
+
     # 当前排名（仅统计已结束轮次）：排名积分降序 -> Buchholz 降序 ->
-    # 编号升序；下一轮积分分组以排名积分（对局积分 - 有效扣分）为准
+    # 编号升序；下一轮积分分组以排名积分（对局积分 - 有效扣分）为准。
+    # 有签到快照时仅到场者参与本轮配对与轮空；缺席者保留积分但不进
+    # 本轮名单（points_by_id 仍保留全员积分供需要时查阅）
     records = compute_records(db, tournament_id)
-    ranking_ids = [r.participant_id for r in records]
     points_by_id = {r.participant_id: r.rank_points for r in records}
+    if present_ids is None:
+        ranking_ids = [r.participant_id for r in records]
+    else:
+        ranking_ids = [r.participant_id for r in records if r.participant_id in present_ids]
 
     # 已经轮空过的选手（轮空在生成轮次时即生成并记分）
     closed_round_ids = [r.id for r in rounds if r.status == "closed"]
@@ -81,9 +116,10 @@ def generate_next_round(
         byed_ids = {m.player_white_id for m in bye_matches}
 
     bye_id: int | None = None
-    if len(tournament_participants) % 2 == 1:
+    if len(ranking_ids) % 2 == 1:
         # 轮空给「尚未轮空且排名最低」的选手；
-        # 若所有人都轮空过，则取排名最低者
+        # 若所有人都轮空过，则取排名最低者。
+        # 有签到快照时候选只含本轮到场者
         eligible = [pid for pid in ranking_ids if pid not in byed_ids]
         bye_id = eligible[-1] if eligible else ranking_ids[-1]
 
@@ -153,9 +189,14 @@ def generate_next_round(
         db.flush()
         bye_match_id = bye_match.id
 
-    # 没有需要录入的普通对局（如仅 1 名参赛者）时直接结束本轮
+    # 没有需要录入的普通对局（全员缺席、或仅 1 名到场者等）时直接
+    # 结束本轮；缺席者不因本轮得到任何积分
     if not result.pairs:
         round_obj.status = "closed"
+
+    # 快照随轮次生成而消费：此后不可再提交/变更（同一事务置位）
+    if snapshot is not None:
+        snapshot.status = CONSUMED
 
     db.flush()
 
@@ -170,6 +211,20 @@ def generate_next_round(
     }
     if bye_match_id is not None:
         generated_payload["bye_match_id"] = bye_match_id
+    if snapshot is not None:
+        # 本轮编排所依据的签到快照（编号按参赛者编号升序）
+        participant_no = {p.id: p.number for p in tournament_participants}
+        generated_payload["attendance_snapshot"] = {
+            "snapshot_id": snapshot.id,
+            "version": snapshot.version,
+            "present_numbers": sorted(
+                participant_no[pid] for pid in present_ids
+            ),
+            "absent_numbers": sorted(
+                participant_no[pid]
+                for pid in roster_pids - present_ids
+            ),
+        }
     events = [
         append_event(db, tournament_id, ROUND_GENERATED, generated_payload)
     ]

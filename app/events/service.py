@@ -35,6 +35,8 @@ RESULT_REVIEW_CREATED = "result_review.created"
 RESULT_REVIEW_CLOSED = "result_review.closed"
 PENALTY_RECORDED = "penalty.recorded"
 PENALTY_REVOKED = "penalty.revoked"
+ATTENDANCE_RECORDED = "attendance.recorded"
+ATTENDANCE_CONFIRMED = "attendance.confirmed"
 
 
 def _allocate_next_seq(db: Session, tournament_id: int) -> int:
